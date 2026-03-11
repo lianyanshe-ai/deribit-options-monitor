@@ -1,0 +1,7 @@
+interface:
+  display_name: "Deribit Options Monitor"
+  short_description: "BTC Deribit 期权扫描、DVOL 与 Sell Put 策略"
+  default_prompt: "Use $deribit-options-monitor to scan BTC options on Deribit and produce a sell-put opportunity report with DVOL, block trades, and alerts."
+
+policy:
+  allow_implicit_invocation: true
