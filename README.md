@@ -42,7 +42,7 @@
 先下载仓库，然后执行一条安装命令：
 
 ```bash
-git clone https://github.com/你的用户名/deribit-options-monitor.git
+git clone https://github.com/lianyanshe-ai/deribit-options-monitor.git
 cd deribit-options-monitor
 bash install.sh
 ```
