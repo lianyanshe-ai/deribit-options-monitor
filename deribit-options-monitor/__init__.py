@@ -30,6 +30,8 @@ def main() -> int:
     sell_put_parser.add_argument("--min-dte", type=int, default=7)
     sell_put_parser.add_argument("--max-dte", type=int, default=45)
     sell_put_parser.add_argument("--top-k", type=int, default=5)
+    sell_put_parser.add_argument("--max-spread-pct", type=float, default=10.0, help="Max bid-ask spread percentage")
+    sell_put_parser.add_argument("--min-open-interest", type=float, default=100.0, help="Min open interest")
 
     scan_parser = subparsers.add_parser("scan", help="Run a full scan")
     scan_parser.add_argument("--currency", default="BTC")
@@ -40,6 +42,8 @@ def main() -> int:
     scan_parser.add_argument("--min-dte", type=int, default=7)
     scan_parser.add_argument("--max-dte", type=int, default=45)
     scan_parser.add_argument("--top-k", type=int, default=5)
+    scan_parser.add_argument("--max-spread-pct", type=float, default=10.0)
+    scan_parser.add_argument("--min-open-interest", type=float, default=100.0)
 
     report_parser = subparsers.add_parser("report", help="Render a scan result")
     report_parser.add_argument("--currency", default="BTC")
@@ -50,6 +54,8 @@ def main() -> int:
     report_parser.add_argument("--min-dte", type=int, default=7)
     report_parser.add_argument("--max-dte", type=int, default=45)
     report_parser.add_argument("--top-k", type=int, default=5)
+    report_parser.add_argument("--max-spread-pct", type=float, default=10.0)
+    report_parser.add_argument("--min-open-interest", type=float, default=100.0)
     report_parser.add_argument("--mode", choices=("report", "json", "alert"), default="report")
 
     args = parser.parse_args()
@@ -73,6 +79,8 @@ def main() -> int:
             min_dte=args.min_dte,
             max_dte=args.max_dte,
             top_k=args.top_k,
+            max_spread_pct=args.max_spread_pct,
+            min_open_interest=args.min_open_interest,
         )
     else:
         scan_result = monitor.run_scan(
@@ -84,6 +92,8 @@ def main() -> int:
             min_dte=args.min_dte,
             max_dte=args.max_dte,
             top_k=args.top_k,
+            max_spread_pct=args.max_spread_pct,
+            min_open_interest=args.min_open_interest,
         )
         if args.command == "report":
             result = dict(scan_result)

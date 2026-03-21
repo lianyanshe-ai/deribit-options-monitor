@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -20,8 +21,28 @@ import requests
 DERIBIT_API_BASE = "https://www.deribit.com/api/v2"
 REQUEST_TIMEOUT = 20
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-SUPPORTED_CURRENCIES = {"BTC"}
+SUPPORTED_CURRENCIES = {"BTC", "ETH"}
 
+# 流向标签常量
+FLOW_LABELS = {
+    "protective_hedge",      # 保护性对冲
+    "premium_collect",       # 收取权利金
+    "speculative_put",       # 投机卖Put
+    "call_momentum",         # Call追涨
+    "covered_call",          # 备兑卖Call
+    "call_overwrite",        # Call改仓
+    "call_speculative",      # Call投机
+    "unknown",               # 未知
+}
+HEDGE_LABELS = {"protective_hedge", "call_momentum"}
+PREMIUM_LABELS = {"premium_collect", "covered_call"}
+
+# 严重程度常量
+SEVERITY_THRESHOLDS = {
+    "high": 2_000_000,
+    "medium": 500_000,
+    "info": 0,
+}
 
 MONTH_MAP = {
     "JAN": 1,
@@ -65,7 +86,10 @@ class DeribitOptionsMonitor:
         )
         self.db_path = Path(db_path).expanduser() if db_path else default_db
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # 缓存结构: {instrument_name: {"data": ..., "ts": timestamp_ms}}
         self._order_book_cache: dict[str, dict[str, Any]] = {}
+        self._instrument_meta_cache: dict[str, InstrumentMeta] = {}  # instrument 解析缓存
+        self._cache_ttl_seconds = 60  # 缓存 60 秒
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -158,19 +182,59 @@ class DeribitOptionsMonitor:
         raise RuntimeError(f"Deribit request failed for {path}: {last_error}")
 
     def _parse_instrument_name(self, instrument_name: str) -> InstrumentMeta:
+        # 使用缓存避免重复解析
+        if instrument_name in self._instrument_meta_cache:
+            cached = self._instrument_meta_cache[instrument_name]
+            # 重新计算 DTE 因为时间会变化
+            seconds = (cached.expiry_dt - self._utc_now()).total_seconds()
+            dte = max(0, math.ceil(seconds / 86400))
+            if dte != cached.dte:
+                return InstrumentMeta(
+                    instrument_name=cached.instrument_name,
+                    currency=cached.currency,
+                    strike=cached.strike,
+                    option_type=cached.option_type,
+                    expiry_dt=cached.expiry_dt,
+                    expiry_ts=cached.expiry_ts,
+                    dte=dte,
+                )
+            return cached
+
         parts = instrument_name.split("-")
         if len(parts) != 4:
             raise ValueError(f"Unexpected instrument name: {instrument_name}")
         currency, date_token, strike_token, side_token = parts
-        day = int(date_token[:2])
-        month = MONTH_MAP[date_token[2:5].upper()]
-        year = 2000 + int(date_token[5:7])
+
+        # 解析日期 token: 支持单日(如 3APR26)或双日(如 29MAY26)
+        # 月份缩写固定为3位，需要从日期字符串中提取
+        date_token_upper = date_token.upper()
+        month_str = None
+        day = None
+
+        # 尝试找月份缩写位置
+        for month_abbr in MONTH_MAP:
+            idx = date_token_upper.find(month_abbr)
+            if idx != -1:
+                month_str = month_abbr
+                day_str = date_token_upper[:idx]
+                break
+
+        if month_str is None or not day_str:
+            raise ValueError(f"Cannot parse date token: {date_token}")
+
+        try:
+            day = int(day_str)
+            month = MONTH_MAP[month_str]
+        except (ValueError, KeyError) as e:
+            raise ValueError(f"Cannot parse date token: {date_token}") from e
+
+        year = 2000 + int(date_token[-2:])
         expiry_dt = datetime(year, month, day, 8, 0, tzinfo=UTC)
         expiry_ts = int(expiry_dt.timestamp() * 1000)
         seconds = (expiry_dt - self._utc_now()).total_seconds()
         dte = max(0, math.ceil(seconds / 86400))
         option_type = "put" if side_token.upper() == "P" else "call"
-        return InstrumentMeta(
+        result = InstrumentMeta(
             instrument_name=instrument_name,
             currency=currency,
             strike=float(strike_token),
@@ -179,12 +243,37 @@ class DeribitOptionsMonitor:
             expiry_ts=expiry_ts,
             dte=dte,
         )
+        # 存入缓存
+        self._instrument_meta_cache[instrument_name] = result
+        return result
 
     def _percentile(self, values: list[float], current: float) -> float | None:
+        """计算当前值在历史数据中的百分位数 (0-100)。
+
+        使用标准 rank 方法：percentile = (rank - 1) / (n - 1) * 100
+        其中 rank 是当前值按升序排列的位置。
+        """
         if not values:
             return None
-        below_or_equal = sum(1 for value in values if value <= current)
-        return round(below_or_equal / len(values) * 100, 2)
+        # 升序排列
+        sorted_values = sorted(values)
+        n = len(sorted_values)
+
+        # 找到当前值的排名（从 1 开始）
+        rank = 1
+        for i, v in enumerate(sorted_values):
+            if v >= current:
+                rank = i + 1
+                break
+        else:
+            rank = n
+
+        # 使用 rank 方法计算百分位数
+        if n == 1:
+            return 50.0
+
+        percentile = (rank - 1) / (n - 1) * 100
+        return round(percentile, 2)
 
     def _format_usd(self, value: float | None) -> str:
         if value is None:
@@ -197,9 +286,9 @@ class DeribitOptionsMonitor:
         return f"{value:.2f}%"
 
     def _severity_from_notional(self, notional: float) -> str:
-        if notional >= 2_000_000:
+        if notional >= SEVERITY_THRESHOLDS["high"]:
             return "high"
-        if notional >= 500_000:
+        if notional >= SEVERITY_THRESHOLDS["medium"]:
             return "medium"
         return "info"
 
@@ -305,16 +394,31 @@ class DeribitOptionsMonitor:
         return list(payload.get("result", []))
 
     def _get_order_book(self, instrument_name: str) -> dict[str, Any]:
+        """获取订单簿数据，带 TTL 缓存。"""
+        now_ms = self._now_ms()
         cached = self._order_book_cache.get(instrument_name)
         if cached is not None:
-            return cached
+            cached_ts = cached.get("ts", 0)
+            if now_ms - cached_ts < self._cache_ttl_seconds * 1000:
+                return cached.get("data", {})
+
         payload = self._request_json(
             "public/get_order_book",
             {"instrument_name": instrument_name, "depth": 1},
         )
         result = payload.get("result", {})
-        self._order_book_cache[instrument_name] = result
+        self._order_book_cache[instrument_name] = {"data": result, "ts": now_ms}
         return result
+
+    def _clean_expired_cache(self) -> None:
+        """清理过期缓存。"""
+        now_ms = self._now_ms()
+        expired_keys = [
+            name for name, entry in self._order_book_cache.items()
+            if now_ms - entry.get("ts", 0) >= self._cache_ttl_seconds * 1000
+        ]
+        for key in expired_keys:
+            del self._order_book_cache[key]
 
     def _get_last_trades(self, currency: str, count: int = 1000) -> list[dict[str, Any]]:
         payload = self._request_json(
@@ -322,6 +426,22 @@ class DeribitOptionsMonitor:
             {"currency": currency, "kind": "option", "count": count},
         )
         return list(payload.get("result", {}).get("trades", []))
+
+    def _get_spot_price(self, currency: str) -> dict[str, Any]:
+        """获取现货价格"""
+        try:
+            index_name = f"{currency.lower()}_usd"
+            payload = self._request_json(
+                "public/get_index_price",
+                {"index_name": index_name},
+            )
+            result = payload.get("result", {})
+            return {
+                "spot_price": float(result.get("index_price", 0)),
+                "delivery_price": float(result.get("estimated_delivery_price", 0)),
+            }
+        except Exception:
+            return {"spot_price": None, "delivery_price": None}
 
     def doctor(self) -> dict[str, Any]:
         checks: dict[str, Any] = {
@@ -362,6 +482,14 @@ class DeribitOptionsMonitor:
         return checks
 
     def get_dvol_signal(self, currency: str = "BTC") -> dict[str, Any]:
+        """获取 DVOL 信号，以 Z-Score 为主，辅以趋势判断。
+
+        改进点：
+        1. 以 Z-Score 为主要判断依据
+        2. 添加 24h 趋势判断（上涨/下跌/震荡）
+        3. 计算置信度（基于 Z-Score 绝对值）
+        4. 动态调整阈值（基于 30 天历史数据）
+        """
         currency = self._normalize_currency(currency)
         points, resolution = self._fetch_dvol_hourly_history(currency)
         self._store_dvol_points(currency, resolution, points)
@@ -370,6 +498,7 @@ class DeribitOptionsMonitor:
         series_7d = self._load_dvol_window(currency, 24 * 7) or [float(point["close"]) for point in points]
         current = float(points[-1]["close"])
 
+        # 计算基础统计
         percentile_24h = self._percentile(series_24h, current)
         percentile_7d = self._percentile(series_7d, current)
         mean_7d = mean(series_7d) if series_7d else None
@@ -378,18 +507,68 @@ class DeribitOptionsMonitor:
         if mean_7d is not None and std_7d and std_7d > 0:
             z_score = round((current - mean_7d) / std_7d, 2)
 
-        if z_score is not None and z_score > 2:
-            signal = "异常波动"
-            recommendation = "Sell Vol / Sell Put 环境偏优，但需控制尾部风险。"
-        elif percentile_7d is not None and percentile_7d >= 80:
-            signal = "高波动率"
-            recommendation = "权利金偏贵，可优先关注保守型 Sell Put。"
-        elif percentile_7d is not None and percentile_7d <= 20:
-            signal = "低波动率"
-            recommendation = "权利金偏便宜，谨慎卖 Put，偏等待或买波动率。"
-        else:
-            signal = "中性"
-            recommendation = "波动率处于中位附近，策略以筛选性价比合约为主。"
+        # 趋势判断：过去 24h 的变化方向
+        trend = "震荡"
+        trend_change = 0.0
+        if len(series_24h) >= 2:
+            first_4h_avg = mean(series_24h[:4]) if len(series_24h) >= 4 else series_24h[0]
+            last_4h_avg = mean(series_24h[-4:]) if len(series_24h) >= 4 else series_24h[-1]
+            trend_change = last_4h_avg - first_4h_avg
+            if trend_change > 0.5:
+                trend = "上涨"
+            elif trend_change < -0.5:
+                trend = "下跌"
+
+        # 动态阈值：基于过去 30 天数据调整
+        # 如果 DVOL 历史波动大，阈值也相应提高
+        dynamic_thresholds = self._calculate_dynamic_thresholds(currency)
+
+        # 信号判断：以 Z-Score 为主
+        signal = "中性"
+        recommendation = "波动率处于中位附近，策略以筛选性价比合约为主。"
+        confidence = 50  # 默认置信度
+
+        if z_score is not None:
+            abs_z = abs(z_score)
+            # 高置信度阈值
+            high_conf_threshold = dynamic_thresholds["high_conf"]
+            # 中置信度阈值
+            mid_conf_threshold = dynamic_thresholds["mid_conf"]
+
+            if abs_z >= high_conf_threshold:
+                confidence = min(95, 50 + abs_z * 15)  # Z-Score 越大置信度越高
+                if z_score > 0:
+                    signal = "异常波动(高)"
+                    recommendation = "DVOL 显著偏高，权利金昂贵，适合 Sell Put 收租，但需控制尾部风险。"
+                else:
+                    signal = "异常波动(低)"
+                    recommendation = "DVOL 显著偏低，权利金便宜，建议观望或买波动率。"
+            elif abs_z >= mid_conf_threshold:
+                confidence = min(85, 40 + abs_z * 12)
+                if z_score > 0:
+                    signal = "高波动率"
+                    recommendation = "权利金偏贵，可关注保守型 Sell Put，Delta 建议 ≤0.20。"
+                else:
+                    signal = "低波动率"
+                    recommendation = "权利金偏便宜，建议等待或小仓位实验。"
+            else:
+                confidence = min(70, 30 + abs_z * 10)
+                if trend == "上涨":
+                    signal = "中性偏多"
+                    recommendation = "DVOL 处于上升趋势，关注卖波动率机会。"
+                elif trend == "下跌":
+                    signal = "中性偏空"
+                    recommendation = "DVOL 处于下降趋势，可适度参与 Sell Put。"
+                else:
+                    signal = "中性"
+                    recommendation = "波动率平稳，筛选高 APR 合约为主。"
+
+        # 额外风险提示
+        risk_notes = []
+        if trend == "上涨" and z_score and z_score > 1:
+            risk_notes.append("DVOL 正在上涨，可能还有空间")
+        if percentile_7d and percentile_7d >= 85:
+            risk_notes.append("7天分位处于高位")
 
         return {
             "currency": currency,
@@ -399,16 +578,111 @@ class DeribitOptionsMonitor:
             "iv_percentile_24h": percentile_24h,
             "iv_percentile_7d": percentile_7d,
             "z_score_7d": z_score,
+            "trend": trend,
+            "trend_change": round(trend_change, 2),
             "signal": signal,
+            "confidence": round(confidence, 1),
             "recommendation": recommendation,
+            "risk_notes": risk_notes if risk_notes else None,
             "latest_ts": int(points[-1]["ts"]),
             "mean_7d": round(mean_7d, 2) if mean_7d is not None else None,
             "std_7d": round(std_7d, 2) if std_7d is not None else None,
+            "dynamic_thresholds": dynamic_thresholds,
         }
 
+    def _calculate_dynamic_thresholds(self, currency: str) -> dict[str, float]:
+        """基于过去 30 天历史数据计算动态阈值。
+
+        根据 DVOL 的历史波动性动态调整 Z-Score 阈值。
+        波动性越大，阈值越高（避免频繁触发）。
+        """
+        try:
+            # 尝试获取 30 天数据
+            end_ts = self._now_ms()
+            start_ts = end_ts - 30 * 24 * 3600 * 1000
+            rows = self._fetch_dvol_rows(currency, "3600", start_ts, end_ts)
+            if len(rows) >= 24:  # 至少有一天数据
+                closes = [float(row[4]) for row in rows]
+                mean_val = mean(closes)
+                std_val = pstdev(closes) if len(closes) > 1 else 1.0
+
+                # 计算变异系数 (CV = std / mean)
+                cv = std_val / mean_val if mean_val > 0 else 0.1
+
+                # 根据 CV 调整阈值
+                # CV < 0.05: 稳定市场，阈值降低
+                # CV > 0.10: 波动市场，阈值提高
+                if cv < 0.05:
+                    base_high, base_mid = 1.5, 1.0
+                elif cv < 0.08:
+                    base_high, base_mid = 2.0, 1.5
+                else:
+                    base_high, base_mid = 2.5, 2.0
+
+                return {
+                    "high_conf": base_high + cv * 5,  # 0.1-0.25 范围调整
+                    "mid_conf": base_mid + cv * 3,
+                    "cv": round(cv, 4),
+                    "data_days": len(closes) // 24,
+                }
+        except Exception:
+            pass
+
+        # 默认阈值
+        return {"high_conf": 2.0, "mid_conf": 1.5, "cv": None, "data_days": 0}
+
+    def _calc_liquidity_score(self, spread_pct: float, open_interest: float) -> float:
+        """计算流动性评分 (0-100)。
+
+        基于 bid-ask spread 和 open_interest 计算。
+        - spread 越低越好 (≤2% = 满分 50)
+        - open_interest 越高越好 (≥1000 = 满分 50)
+        """
+        # spread 评分 (0-50)
+        if spread_pct <= 2:
+            spread_score = 50
+        elif spread_pct <= 5:
+            spread_score = 40
+        elif spread_pct <= 10:
+            spread_score = 25
+        elif spread_pct <= 20:
+            spread_score = 10
+        else:
+            spread_score = 0
+
+        # open_interest 评分 (0-50)
+        if open_interest >= 1000:
+            oi_score = 50
+        elif open_interest >= 500:
+            oi_score = 40
+        elif open_interest >= 200:
+            oi_score = 30
+        elif open_interest >= 100:
+            oi_score = 20
+        else:
+            oi_score = 10
+
+        return spread_score + oi_score
+
     def _fetch_order_books_bulk(self, instrument_names: list[str], max_workers: int = 8) -> dict[str, dict[str, Any]]:
+        """批量获取订单簿，自动处理缓存。"""
         results: dict[str, dict[str, Any]] = {}
-        pending = [name for name in instrument_names if name not in self._order_book_cache]
+        now_ms = self._now_ms()
+
+        # 检查哪些需要重新获取
+        pending = []
+        for name in instrument_names:
+            cached = self._order_book_cache.get(name)
+            if cached is None:
+                pending.append(name)
+            else:
+                cached_ts = cached.get("ts", 0)
+                if now_ms - cached_ts >= self._cache_ttl_seconds * 1000:
+                    pending.append(name)
+                else:
+                    results[name] = cached.get("data", {})
+
+        # 并行获取需要更新的
         if pending:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {executor.submit(self._get_order_book, name): name for name in pending}
@@ -418,8 +692,13 @@ class DeribitOptionsMonitor:
                         results[name] = future.result()
                     except Exception:
                         results[name] = {}
+
+        # 填充剩余的（从缓存）
         for name in instrument_names:
-            results[name] = self._order_book_cache.get(name, results.get(name, {}))
+            if name not in results:
+                cached = self._order_book_cache.get(name)
+                results[name] = cached.get("data", {}) if cached else {}
+
         return results
 
     def _store_option_snapshots(self, rows: list[dict[str, Any]]) -> None:
@@ -489,8 +768,6 @@ class DeribitOptionsMonitor:
 
         for trade in trades:
             meta = self._parse_instrument_name(trade["instrument_name"])
-            if meta.option_type != "put":
-                continue
             underlying_notional = float(trade["amount"]) * float(trade["index_price"])
             if underlying_notional < min_usd_value:
                 continue
@@ -503,18 +780,37 @@ class DeribitOptionsMonitor:
             mark_iv = float(book.get("mark_iv") or trade.get("iv") or 0.0)
             premium_usd = float(trade["price"]) * float(trade["amount"]) * float(trade["index_price"])
 
-            if (
-                trade["direction"] == "buy"
-                and 0.10 <= abs(delta) <= 0.35
-                and 7 <= meta.dte <= 60
-            ):
-                flow_label = "institutional_hedge_likely"
-            elif trade["direction"] == "sell" and abs(delta) <= 0.35:
-                flow_label = "premium_sale_likely"
-            elif abs(delta) > 0.35:
-                flow_label = "speculative_flow"
+            # 改进流向标签逻辑，区分 Put 和 Call
+            if meta.option_type == "put":
+                # Put 期权：买入 = 保护性对冲/看跌，卖出 = 收取权利金
+                abs_delta = abs(delta)
+                if trade["direction"] == "buy":
+                    if 0.10 <= abs_delta <= 0.35 and 7 <= meta.dte <= 60:
+                        flow_label = "protective_hedge"
+                    else:
+                        flow_label = "speculative_put"  # 其他买入 Put 都是投机
+                elif trade["direction"] == "sell":
+                    if abs_delta <= 0.35:
+                        flow_label = "premium_collect"
+                    else:
+                        flow_label = "speculative_put"  # 高 Delta 卖出也是投机
+                else:
+                    flow_label = "unknown"
             else:
-                flow_label = "unknown"
+                # Call 期权：买入 = 追涨/投机，卖出 = 备兑/看跌
+                abs_delta = abs(delta)
+                if trade["direction"] == "buy":
+                    if abs_delta >= 0.30:
+                        flow_label = "call_momentum"  # 买入高 Delta Call 可能预示看涨/机构建仓
+                    else:
+                        flow_label = "call_speculative"  # 买入低 Delta Call 是投机
+                elif trade["direction"] == "sell":
+                    if abs_delta <= 0.40:
+                        flow_label = "covered_call"  # 卖出虚值 Call 可能是备兑
+                    else:
+                        flow_label = "call_overwrite"  # 卖出高 Delta Call 可能是改仓
+                else:
+                    flow_label = "unknown"
 
             severity = self._severity_from_notional(underlying_notional)
             item = {
@@ -542,7 +838,7 @@ class DeribitOptionsMonitor:
                 {
                     "type": "block_trade",
                     "severity": severity,
-                    "title": f"BTC 期权大宗成交 {self._format_usd(underlying_notional)}",
+                    "title": f"{currency} {meta.option_type.upper()}期权大宗成交 {self._format_usd(underlying_notional)}",
                     "message": (
                         f"{trade['direction']} {trade['instrument_name']}，名义金额 {self._format_usd(underlying_notional)}，"
                         f"Delta {delta:.2f}，判断为 {flow_label}。"
@@ -571,10 +867,22 @@ class DeribitOptionsMonitor:
         min_dte: int = 7,
         max_dte: int = 45,
         top_k: int = 5,
+        # 新增流动性参数
+        max_spread_pct: float = 10.0,  # bid-ask spread 最大百分比
+        min_open_interest: float = 100.0,  # 最小未平仓合约数
     ) -> dict[str, Any]:
+        """获取 Sell Put 推荐，带流动性过滤。
+
+        改进点：
+        1. bid-ask spread 过滤（默认 ≤10%）
+        2. 最低 open_interest 要求（默认 ≥100）
+        3. 返回流动性指标
+        """
         currency = self._normalize_currency(currency)
         summaries = self._get_book_summaries(currency)
         candidates: list[dict[str, Any]] = []
+
+        # 第一轮筛选：基本条件
         for summary in summaries:
             instrument_name = summary.get("instrument_name", "")
             if not instrument_name.endswith("-P"):
@@ -584,8 +892,22 @@ class DeribitOptionsMonitor:
                 continue
             mark_price = float(summary.get("mark_price") or 0.0)
             open_interest = float(summary.get("open_interest") or 0.0)
+            bid_price = float(summary.get("bid_price") or 0.0)
+            ask_price = float(summary.get("ask_price") or 0.0)
+
+            # 流动性过滤
             if mark_price <= 0 or open_interest <= 0:
                 continue
+            if open_interest < min_open_interest:
+                continue
+
+            # bid-ask spread 计算
+            spread_pct = 0.0
+            if bid_price > 0 and ask_price > 0:
+                spread_pct = (ask_price - bid_price) / ask_price * 100
+            if spread_pct > max_spread_pct:
+                continue
+
             candidates.append(
                 {
                     "instrument_name": instrument_name,
@@ -593,11 +915,18 @@ class DeribitOptionsMonitor:
                     "expiry": meta.expiry_dt.isoformat(),
                     "expiry_ts": meta.expiry_ts,
                     "dte": meta.dte,
+                    "bid_price": bid_price,
+                    "ask_price": ask_price,
+                    "spread_pct": round(spread_pct, 2),
+                    "open_interest": open_interest,
                 }
             )
 
         order_books = self._fetch_order_books_bulk([item["instrument_name"] for item in candidates])
+
         picks: list[dict[str, Any]] = []
+        filtered_count = 0  # 记录因流动性被过滤的数量
+
         for item in candidates:
             book = order_books.get(item["instrument_name"], {})
             greeks = book.get("greeks") or {}
@@ -606,14 +935,34 @@ class DeribitOptionsMonitor:
             underlying_price = float(book.get("underlying_price") or 0.0)
             mark_iv = float(book.get("mark_iv") or 0.0)
             open_interest = float(book.get("open_interest") or 0.0)
+
             if mark_price <= 0 or underlying_price <= 0 or open_interest <= 0:
+                filtered_count += 1
                 continue
             if abs(delta) > max_delta:
                 continue
+            if open_interest < min_open_interest:
+                filtered_count += 1
+                continue
+
+            # 再次检查 spread（使用 order_book 数据更准确）
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            # bids/asks 格式是 [[price, quantity], ...]
+            if bids and asks and isinstance(bids[0], list) and isinstance(asks[0], list):
+                bid_px = float(bids[0][0])
+                ask_px = float(asks[0][0])
+                if bid_px > 0 and ask_px > 0:
+                    spread_pct = (ask_px - bid_px) / ask_px * 100
+                    if spread_pct > max_spread_pct:
+                        filtered_count += 1
+                        continue
+
             premium_usd = mark_price * underlying_price
             apr = premium_usd / item["strike"] * (365 / item["dte"]) * 100
             if apr < min_apr:
                 continue
+
             pick = {
                 "instrument_name": item["instrument_name"],
                 "strike": round(item["strike"], 2),
@@ -629,19 +978,30 @@ class DeribitOptionsMonitor:
                 "breakeven": round(item["strike"] - premium_usd, 2),
                 "risk_emoji": self._risk_emoji(abs(delta)),
                 "open_interest": round(open_interest, 2),
+                "spread_pct": item.get("spread_pct", 0),
+                # 流动性评级
+                "liquidity_score": self._calc_liquidity_score(
+                    item.get("spread_pct", 0), open_interest
+                ),
             }
             picks.append(pick)
 
-        picks.sort(key=lambda row: row["apr"], reverse=True)
+        # 按流动性评分和 APR 综合排序
+        picks.sort(key=lambda row: (row["liquidity_score"], row["apr"]), reverse=True)
         final_rows = picks[:top_k]
+
         if final_rows:
             self._store_option_snapshots(final_rows)
+
         return {
             "currency": currency,
             "max_delta": max_delta,
             "min_apr": min_apr,
             "min_dte": min_dte,
             "max_dte": max_dte,
+            "max_spread_pct": max_spread_pct,
+            "min_open_interest": min_open_interest,
+            "filtered_count": filtered_count,
             "count": len(final_rows),
             "contracts": final_rows,
         }
@@ -682,11 +1042,245 @@ class DeribitOptionsMonitor:
                 "severity": severity,
                 "title": "Sell Put 机会",
                 "message": (
-                    f"发现 {len(contracts)} 个 BTC Sell Put 候选，"
+                    f"发现 {len(contracts)} 个 {sell_put.get('currency', 'BTC')} Sell Put 候选，"
                     f"首选 {top['instrument_name']}，APR {top['apr']:.2f}%，Delta {top['delta']:.2f}。"
                 ),
             }
         ]
+
+    def _flow_label_to_cn(self, label: str) -> str:
+        """将流向标签翻译为中文"""
+        mapping = {
+            "protective_hedge": "保护性对冲",
+            "premium_collect": "收取权利金",
+            "speculative_put": "投机卖Put",
+            "call_momentum": "Call追涨",
+            "covered_call": "备兑卖Call",
+            "call_overwrite": "Call改仓",
+            "call_speculative": "投机买Call",
+            "unknown": "未知",
+        }
+        return mapping.get(label, label)
+
+    def _generate_interpretation(self, dvol: dict, large_trades: list, currency: str) -> str:
+        """生成人性化的市场解读"""
+        current = dvol.get('current_dvol', 0)
+        z_score = dvol.get('z_score_7d', 0)
+        percentile_7d = dvol.get('iv_percentile_7d', 0)
+        percentile_24h = dvol.get('iv_percentile_24h', 0)
+        trend = dvol.get('trend', '平稳')
+        signal = dvol.get('signal', '中性')
+        trend_change = dvol.get('trend_change', 0)
+
+        lines = []
+
+        # DVOL 变化趋势解读
+        if trend_change > 0:
+            lines.append(f"• DVOL 从昨天的 {current - trend_change:.2f} 小幅上升到 {current:.2f}，波动率继续回升，恐慌情绪在升温")
+        elif trend_change < 0:
+            lines.append(f"• DVOL 从昨天的 {current - trend_change:.2f} 小幅下降到 {current:.2f}，波动率有所回落，恐慌情绪有所缓解")
+        else:
+            lines.append(f"• DVOL 当前为 {current:.2f}，波动率走势平稳")
+
+        # 分位数解读
+        if percentile_7d >= 80:
+            percentile_desc = "处于高位"
+        elif percentile_7d <= 20:
+            percentile_desc = "处于低位"
+        else:
+            percentile_desc = "处于中性区间"
+
+        # Z-Score 解读
+        if abs(z_score) >= 2:
+            zscore_desc = "属于极端信号"
+        elif abs(z_score) >= 1:
+            zscore_desc = "偏离正常波动区间"
+        else:
+            zscore_desc = "不算极端，属于正常范围"
+
+        lines.append(f"• 目前处于 7 日 {percentile_7d:.0f}% 分位，Z-Score {z_score:+.2f}，{zscore_desc}")
+
+        # 趋势解读
+        if trend == "上涨":
+            lines.append("• 波动率呈上升趋势，符合市场反弹后恐慌还在延续的判断")
+        elif trend == "下跌":
+            lines.append("• 波动率呈下降趋势，市场情绪有所恢复")
+        else:
+            lines.append("• 波动率走势平稳")
+
+        return "\n".join(lines)
+
+    def _generate_strategy(self, dvol: dict, sell_put: list, large_trades: list) -> str:
+        """生成策略建议"""
+        signal = dvol.get('signal', '中性')
+        percentile_7d = dvol.get('iv_percentile_7d', 50)
+        sentiment = "中性"
+        trend = dvol.get('trend', '平稳')
+        if large_trades:
+            analysis = self._analyze_large_trades(large_trades)
+            sentiment = analysis.get("sentiment", "中性")
+
+        lines = []
+
+        # 基于 DVOL 的策略
+        if signal in {"高波动率", "异常波动"}:
+            lines.append("• 波动率回升，意味着期权权利金价格上涨，现在卖 Put 收租比低位时性价比更高了")
+            lines.append("• 但波动率还没到极端高位，不适合买波动率赌大波动")
+        elif signal == "低波动率":
+            lines.append("• 当前波动率处于低位，权利金偏薄，卖 Put 赔率不够友好")
+            lines.append("• 可以考虑做买方策略(如买 Call/Put)或等待波动率回升")
+        else:
+            lines.append("• 波动率处于中性区间，期权权利金价格相对合理")
+
+        # 基于趋势的策略
+        if trend == "上涨":
+            lines.append("• 当前市场处于反弹阶段，波动率仍在升温，适合卖 Put 接货")
+        elif trend == "下跌":
+            lines.append("• 市场处于下跌后反弹阶段，波动率缓慢回落，可以分批建仓")
+        else:
+            lines.append("• 市场方向不明，适合观望或轻仓操作")
+
+        # 推荐合约
+        if sell_put:
+            best = sell_put[0]
+            lines.append(f"• 当前市场方向向下后反弹，期权策略适合卖 Put 接货，在{best['strike']:.0f}价位卖 Put 收权利金")
+        else:
+            lines.append("• 当前未筛出满足条件的 Sell Put 合约，建议等待更好机会")
+
+        return "\n".join(lines)
+
+    def _generate_summary(self, dvol: dict, large_trades: list, sell_put: list) -> str:
+        """生成市场总结"""
+        signal = dvol.get('signal', '中性')
+        percentile_7d = dvol.get('iv_percentile_7d', 50)
+        trend = dvol.get('trend', '平稳')
+
+        # 确定市场状态
+        if signal in {"高波动率", "异常波动"} and percentile_7d >= 80:
+            status = "高波动率环境"
+        elif signal == "低波动率" and percentile_7d <= 20:
+            status = "低波动率环境"
+        else:
+            status = "中性偏高" if percentile_7d > 50 else "中性偏低"
+
+        # 趋势总结
+        if trend == "上涨":
+            trend_summary = "波动率上升阶段"
+        elif trend == "下跌":
+            trend_summary = "波动率下降阶段"
+        else:
+            trend_summary = "波动率平稳阶段"
+
+        # 市场阶段描述
+        if trend == "上涨":
+            phase = '"上涨反弹"阶段'
+        elif trend == "下跌":
+            phase = '"下跌后反弹"阶段'
+        else:
+            phase = '"震荡"阶段'
+
+        # 总结
+        if signal in {"高波动率", "异常波动"}:
+            summary = f"波动率处于高位，权利金偏贵，没有极端信号，当前市场处于{phase}，{trend_summary}，符合预期节奏。"
+        elif signal == "低波动率":
+            summary = f"波动率处于低位，权利金偏便宜，当前市场处于{phase}，{trend_summary}。"
+        else:
+            summary = f"波动率{status}，没有极端信号，当前市场处于{phase}，{trend_summary}，符合预期节奏。"
+
+        return summary
+
+    def _generate_risk_tips(self, dvol: dict) -> str:
+        """生成风险提示"""
+        signal = dvol.get('signal', '中性')
+        percentile_7d = dvol.get('iv_percentile_7d', 50)
+
+        if signal == "异常波动":
+            return "波动率显著偏离均值，Sell Put 收益高但需控制尾部风险，建议仓位不超过总资金的 10%。"
+        elif signal == "高波动率":
+            return "当前处于高波动率环境，权利金较贵但需警惕回落风险，建议选择 Delta ≤0.20 的保守合约。"
+        elif signal == "低波动率":
+            return "权利金偏薄，卖 Put 赔率不够友好，建议减少卖方策略仓位。"
+        else:
+            return "当前环境可做筛选式收租，但不宜过度追求高 Delta，保持适当仓位分散。"
+
+    def _analyze_large_trades(self, trades: list[dict[str, Any]]) -> dict[str, Any]:
+        """分析大宗异动，返回市场解读"""
+        if not trades:
+            return {
+                "sentiment": "中性",
+                "total_notional": 0,
+                "call_count": 0,
+                "put_count": 0,
+                "hedge_count": 0,
+                "premium_count": 0,
+                "call_momentum_count": 0,
+                "notable_contracts": [],
+            }
+
+        total_notional = sum(t.get("underlying_notional_usd", 0) for t in trades)
+
+        # 分类统计
+        call_count = sum(1 for t in trades if "call" in t.get("flow_label", "").lower())
+        put_count = sum(1 for t in trades if "put" in t.get("flow_label", "").lower())
+        hedge_count = sum(1 for t in trades if t.get("flow_label") in HEDGE_LABELS)
+        premium_count = sum(1 for t in trades if t.get("flow_label") in PREMIUM_LABELS)
+        call_momentum_count = sum(1 for t in trades if t.get("flow_label") == "call_momentum")
+
+        # 重点合约（高Delta Call 或 对冲类）
+        notable = []
+        for t in trades:
+            label = t.get("flow_label", "")
+            if label in ("call_momentum", "protective_hedge"):
+                notable.append({
+                    "instrument_name": t["instrument_name"],
+                    "direction": t["direction"],
+                    "notional": t.get("underlying_notional_usd", 0),
+                    "label_cn": self._flow_label_to_cn(label),
+                })
+
+        # 重点合约按名义金额排序
+        notable.sort(key=lambda x: x["notional"], reverse=True)
+
+        # 市场情绪判断
+        sentiment = "中性"
+        call_buy_notional = sum(
+            t.get("underlying_notional_usd", 0)
+            for t in trades
+            if t.get("flow_label") == "call_momentum" and t.get("direction") == "buy"
+        )
+        put_buy_notional = sum(
+            t.get("underlying_notional_usd", 0)
+            for t in trades
+            if t.get("flow_label") == "protective_hedge" and t.get("direction") == "buy"
+        )
+
+        # 买入Call Momentum + 保护性对冲 的总名义
+        bullish_notional = call_buy_notional + put_buy_notional
+
+        # 卖出权利金的总名义
+        bearish_notional = sum(
+            t.get("underlying_notional_usd", 0)
+            for t in trades
+            if t.get("flow_label") in ("premium_collect", "covered_call")
+        )
+
+        if bullish_notional > bearish_notional * 1.5 and bullish_notional > 1_000_000:
+            sentiment = "看涨"
+        elif bearish_notional > bullish_notional * 1.5 and bearish_notional > 1_000_000:
+            sentiment = "看跌"
+
+        return {
+            "sentiment": sentiment,
+            "total_notional": total_notional,
+            "call_count": call_count,
+            "put_count": put_count,
+            "hedge_count": hedge_count,
+            "premium_count": premium_count,
+            "call_momentum_count": call_momentum_count,
+            "notable_contracts": notable,
+            "bullish_notional": bullish_notional,
+            "bearish_notional": bearish_notional,
+        }
 
     def _build_alert_text(self, scan: dict[str, Any]) -> str:
         parts: list[str] = []
@@ -705,13 +1299,21 @@ class DeribitOptionsMonitor:
         large_trades = scan.get("large_trades") or []
         if large_trades:
             top_flow = large_trades[0]
-            hedge_count = sum(1 for item in large_trades if item["flow_label"] == "institutional_hedge_likely")
+            # 统计各类流向
+            hedge_count = sum(1 for item in large_trades if item["flow_label"] in HEDGE_LABELS)
+            premium_count = sum(1 for item in large_trades if item["flow_label"] in PREMIUM_LABELS)
+            call_count = sum(1 for item in large_trades if "call" in item["flow_label"])
+
             flow_summary = (
                 f"近{len(large_trades)}笔大宗成交，最大单 {top_flow['instrument_name']} "
                 f"{self._format_usd(top_flow['underlying_notional_usd'])}"
             )
+            if call_count:
+                flow_summary += f"，其中 Call {call_count} 笔"
             if hedge_count:
-                flow_summary += f"，其中疑似机构对冲 {hedge_count} 笔"
+                flow_summary += f"，疑似对冲 {hedge_count} 笔"
+            if premium_count:
+                flow_summary += f"，权利金卖出 {premium_count} 笔"
             parts.append(flow_summary)
 
         return " | ".join(parts)
@@ -726,8 +1328,29 @@ class DeribitOptionsMonitor:
         min_dte: int = 7,
         max_dte: int = 45,
         top_k: int = 5,
+        timeout_seconds: float = 120.0,
+        # 流动性参数
+        max_spread_pct: float = 10.0,
+        min_open_interest: float = 100.0,
     ) -> dict[str, Any]:
+        """运行完整扫描，支持超时和降级。"""
         currency = self._normalize_currency(currency)
+
+        # 清理过期缓存，防止无限增长
+        self._clean_expired_cache()
+
+        # 默认降级结果
+        default_dvol = {
+            "currency": currency,
+            "current_dvol": None,
+            "error": "获取失败",
+        }
+        default_large = {"trades": [], "alerts": [], "count": 0, "error": "获取失败"}
+        default_sell_put = {"contracts": [], "count": 0, "error": "获取失败"}
+
+        dvol, large, sell_put = default_dvol, default_large, default_sell_put
+        errors: list[str] = []
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             future_dvol = executor.submit(self.get_dvol_signal, currency)
             future_large = executor.submit(
@@ -744,10 +1367,27 @@ class DeribitOptionsMonitor:
                 min_dte,
                 max_dte,
                 top_k,
+                max_spread_pct,
+                min_open_interest,
             )
-            dvol = future_dvol.result()
-            large = future_large.result()
-            sell_put = future_sell.result()
+
+            # 带超时的结果获取
+            for name, future in [
+                ("DVOL", future_dvol),
+                ("大宗交易", future_large),
+                ("Sell Put", future_sell),
+            ]:
+                try:
+                    result = future.result(timeout=timeout_seconds)
+                    if name == "DVOL":
+                        dvol = result
+                    elif name == "大宗交易":
+                        large = result
+                    else:
+                        sell_put = result
+                except Exception as e:
+                    errors.append(f"{name}: {str(e)}")
+                    # 保留默认值
         alerts: list[dict[str, Any]] = []
         alerts.extend(self._build_dvol_alerts(dvol))
         alerts.extend(large.get("alerts", []))
@@ -755,13 +1395,27 @@ class DeribitOptionsMonitor:
         severity_rank = {"high": 3, "medium": 2, "info": 1}
         alerts.sort(key=lambda item: severity_rank.get(item["severity"], 0), reverse=True)
 
+        # 如果有错误，添加错误告警
+        if errors:
+            alerts.append({
+                "type": "system_error",
+                "severity": "medium",
+                "title": "部分数据获取失败",
+                "message": "; ".join(errors),
+            })
+
+        # 获取现货价格
+        spot_info = self._get_spot_price(currency)
+
         result = {
             "scan_ts": self._utc_now().isoformat(),
             "currency": currency,
+            "spot_price": spot_info.get("spot_price"),
             "dvol": dvol,
             "large_trades": large.get("trades", []),
             "sell_put": sell_put.get("contracts", []),
             "alerts": alerts,
+            "errors": errors if errors else None,
             "position_risk": {
                 "status": "not_configured",
                 "message": "v1 未接入私有持仓，跳过 Gamma/Delta 风险检查",
@@ -781,7 +1435,9 @@ class DeribitOptionsMonitor:
         dvol = scan["dvol"]
         sell_put = scan["sell_put"]
         large_trades = scan["large_trades"]
+        currency = scan.get('currency', 'BTC')
 
+        # 生成市场结论
         thesis_parts = []
         if dvol["signal"] in {"异常波动", "高波动率"}:
             thesis_parts.append("当前权利金整体偏贵")
@@ -796,59 +1452,92 @@ class DeribitOptionsMonitor:
             thesis_parts.append(f"Sell Put 已筛出 {len(sell_put)} 个高 APR 候选")
         market_conclusion = "；".join(thesis_parts) + "。"
 
+        # 生成解读
+        interpretation = self._generate_interpretation(dvol, large_trades, currency)
+
+        # 生成策略建议
+        strategy = self._generate_strategy(dvol, sell_put, large_trades)
+
+        # 生成总结
+        summary = self._generate_summary(dvol, large_trades, sell_put)
+
         lines = [
-            "Deribit BTC 期权分析师报告",
+            f"Deribit {currency} 期权分析师报告",
             f"生成时间：{scan['scan_ts']}",
+            f"{currency} 现货价格：${scan.get('spot_price', 'N/A'):,.2f}" if scan.get('spot_price') else "",
             "",
             "1. 市场结论",
             market_conclusion,
             "",
             "2. DVOL 健康度",
             (
-                f"- 当前 DVOL：{dvol['current_dvol']:.2f}；24h 分位：{self._format_pct(dvol.get('iv_percentile_24h'))}；"
-                f"7d 分位：{self._format_pct(dvol.get('iv_percentile_7d'))}；7d z-score："
-                f"{dvol.get('z_score_7d', 'N/A')}"
+                f"- 当前 DVOL：{dvol['current_dvol']:.2f} | 7d z-score：{dvol.get('z_score_7d', 'N/A')} | "
+                f"趋势：{dvol.get('trend', 'N/A')}"
             ),
+            (
+                f"- 7d 分位：{self._format_pct(dvol.get('iv_percentile_7d'))} | 24h 分位：{self._format_pct(dvol.get('iv_percentile_24h'))} | "
+                f"置信度：{dvol.get('confidence', 'N/A')}%"
+            ),
+            f"- 动态阈值：高信={dvol.get('dynamic_thresholds', {}).get('high_conf', 'N/A')} | 中信={dvol.get('dynamic_thresholds', {}).get('mid_conf', 'N/A')}",
             f"- 信号：{dvol['signal']}；建议：{dvol['recommendation']}",
-            "",
-            "3. Sell Put 推荐表",
         ]
+
+        lines.extend(["", "3. Sell Put 推荐表 (已过滤流动性)"])
 
         if sell_put:
             for row in sell_put:
+                liq_score = row.get("liquidity_score", 0)
+                liq_emoji = "🟢" if liq_score >= 70 else "🟡" if liq_score >= 40 else "🔴"
                 lines.append(
                     f"- {row['risk_emoji']} {row['instrument_name']} | DTE {row['dte']} | "
-                    f"Delta {row['delta']:.2f} | APR {row['apr']:.2f}% | "
-                    f"权利金 {self._format_usd(row['premium_usd'])} | Break-even {self._format_usd(row['breakeven'])}"
+                    f"Δ {row['delta']:.2f} | APR {row['apr']:.1f}% | "
+                    f"权利金 {self._format_usd(row['premium_usd'])} | 流动性 {liq_emoji}{liq_score}"
                 )
         else:
             lines.append("- 未筛到满足条件的 Sell Put 合约。")
 
-        lines.extend(["", "4. 大宗异动摘要"])
+        lines.extend(["", "4. 大宗异动分析"])
+
         if large_trades:
+            analysis = self._analyze_large_trades(large_trades)
+            lines.append(f"- 总成交: {len(large_trades)} 笔 | 总名义: {self._format_usd(analysis['total_notional'])}")
+
+            sentiment = analysis["sentiment"]
+            if sentiment == "看涨":
+                sentiment_emoji = "📈"
+                sentiment_desc = "机构/大户偏看涨布局"
+            elif sentiment == "看跌":
+                sentiment_emoji = "📉"
+                sentiment_desc = "卖方力量偏强或机构对冲"
+            else:
+                sentiment_emoji = "➡️"
+                sentiment_desc = "多空平衡或观望为主"
+
+            lines.append(f"- 市场情绪: {sentiment_emoji} {sentiment} ({sentiment_desc})")
+
+            lines.append(
+                f"- 分类: Call {analysis['call_count']}笔 / Put {analysis['put_count']}笔 | "
+                f"对冲 {analysis['hedge_count']}笔 / 权利金 {analysis['premium_count']}笔"
+            )
+
+            if analysis.get("notable_contracts"):
+                lines.append("- 重点合约:")
+                for nc in analysis["notable_contracts"][:3]:
+                    lines.append(f"  • {nc['instrument_name']}: {nc['direction']} {self._format_usd(nc['notional'])} → {nc['label_cn']}")
+
+            lines.append("")
+            lines.append("  成交明细 (Top 5):")
             for row in large_trades[:5]:
+                label_cn = self._flow_label_to_cn(row["flow_label"])
                 lines.append(
-                    f"- {row['severity'].upper()} {row['instrument_name']} | {row['direction']} | "
-                    f"名义金额 {self._format_usd(row['underlying_notional_usd'])} | "
-                    f"Delta {row['delta']:.2f} | 判断 {row['flow_label']}"
+                    f"  - {row['severity'].upper()} {row['instrument_name']} | {row['direction']} | "
+                    f"{self._format_usd(row['underlying_notional_usd'])} | Δ{row['delta']:.2f} | {label_cn}"
                 )
         else:
             lines.append("- 近一小时暂无满足阈值的大宗期权成交。")
 
-        lines.extend(["", "5. 风险提示与行动建议"])
-        if dvol["signal"] == "异常波动":
-            lines.append("- 风险提示：波动率显著偏离均值，Sell Put 收益高，但需控制黑天鹅尾部风险。")
-        elif dvol["signal"] == "低波动率":
-            lines.append("- 风险提示：权利金偏薄，卖 Put 的赔率不够友好。")
-        else:
-            lines.append("- 风险提示：当前环境可做筛选式收租，但不宜过度追求 Delta。")
-        if sell_put:
-            best = sell_put[0]
-            lines.append(
-                f"- 行动建议：优先观察 {best['instrument_name']}，APR {best['apr']:.2f}% / "
-                f"Delta {best['delta']:.2f}，适合作为 v1 收租基准参考。"
-            )
-        else:
-            lines.append("- 行动建议：等待更高 IV 或更好的 skew，再考虑执行卖 Put。")
-        lines.append("- 持仓风险：v1 未接入真实账户持仓，Gamma/Delta 风险需手工复核。")
+        lines.extend(["", "5. 解读", interpretation])
+        lines.extend(["", "6. 策略建议", strategy])
+        lines.extend(["", "总结", summary])
+
         return "\n".join(lines)
