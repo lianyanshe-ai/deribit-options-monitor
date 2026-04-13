@@ -89,7 +89,7 @@ SQLite 本地缓存历史数据，支持：
 ### 安装
 
 ```bash
-git clone https://github.com/你的用户名/deribit-options-monitor.git
+git clone https://github.com/lianyanshe-ai/deribit-options-monitor.git
 cd deribit-options-monitor
 pip install -r requirements.txt
 ```
