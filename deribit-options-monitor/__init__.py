@@ -33,6 +33,19 @@ def main() -> int:
     sell_put_parser.add_argument("--max-spread-pct", type=float, default=10.0, help="Max bid-ask spread percentage")
     sell_put_parser.add_argument("--min-open-interest", type=float, default=100.0, help="Min open interest")
 
+    sell_call_parser = subparsers.add_parser("sell-call", help="Get sell call recommendations")
+    sell_call_parser.add_argument("--currency", default="BTC")
+    sell_call_parser.add_argument("--max-delta", type=float, default=0.20)
+    sell_call_parser.add_argument("--min-apr", type=float, default=15.0)
+    sell_call_parser.add_argument("--min-dte", type=int, default=7)
+    sell_call_parser.add_argument("--max-dte", type=int, default=45)
+    sell_call_parser.add_argument("--top-k", type=int, default=5)
+    sell_call_parser.add_argument("--max-spread-pct", type=float, default=10.0, help="Max bid-ask spread percentage")
+    sell_call_parser.add_argument("--min-open-interest", type=float, default=100.0, help="Min open interest")
+
+    rv_parser = subparsers.add_parser("rv", help="Get RV/IV realized volatility signal")
+    rv_parser.add_argument("--currency", default="BTC")
+
     scan_parser = subparsers.add_parser("scan", help="Run a full scan")
     scan_parser.add_argument("--currency", default="BTC")
     scan_parser.add_argument("--min-usd-value", type=float, default=500000)
@@ -44,6 +57,8 @@ def main() -> int:
     scan_parser.add_argument("--top-k", type=int, default=5)
     scan_parser.add_argument("--max-spread-pct", type=float, default=10.0)
     scan_parser.add_argument("--min-open-interest", type=float, default=100.0)
+    scan_parser.add_argument("--max-delta-sell-call", type=float, default=0.20, help="Max delta for sell call recommendations")
+    scan_parser.add_argument("--min-apr-sell-call", type=float, default=15.0, help="Min APR for sell call recommendations")
 
     report_parser = subparsers.add_parser("report", help="Render a scan result")
     report_parser.add_argument("--currency", default="BTC")
@@ -56,6 +71,8 @@ def main() -> int:
     report_parser.add_argument("--top-k", type=int, default=5)
     report_parser.add_argument("--max-spread-pct", type=float, default=10.0)
     report_parser.add_argument("--min-open-interest", type=float, default=100.0)
+    report_parser.add_argument("--max-delta-sell-call", type=float, default=0.20, help="Max delta for sell call recommendations")
+    report_parser.add_argument("--min-apr-sell-call", type=float, default=15.0, help="Min APR for sell call recommendations")
     report_parser.add_argument("--mode", choices=("report", "json", "alert"), default="report")
 
     args = parser.parse_args()
@@ -82,6 +99,19 @@ def main() -> int:
             max_spread_pct=args.max_spread_pct,
             min_open_interest=args.min_open_interest,
         )
+    elif args.command == "sell-call":
+        result = monitor.get_sell_call_recommendations(
+            currency=args.currency,
+            max_delta=args.max_delta,
+            min_apr=args.min_apr,
+            min_dte=args.min_dte,
+            max_dte=args.max_dte,
+            top_k=args.top_k,
+            max_spread_pct=args.max_spread_pct,
+            min_open_interest=args.min_open_interest,
+        )
+    elif args.command == "rv":
+        result = monitor.get_rv_iv_signal(currency=args.currency)
     else:
         scan_result = monitor.run_scan(
             currency=args.currency,
@@ -94,6 +124,8 @@ def main() -> int:
             top_k=args.top_k,
             max_spread_pct=args.max_spread_pct,
             min_open_interest=args.min_open_interest,
+            max_delta_sell_call=args.max_delta_sell_call,
+            min_apr_sell_call=args.min_apr_sell_call,
         )
         if args.command == "report":
             result = dict(scan_result)
