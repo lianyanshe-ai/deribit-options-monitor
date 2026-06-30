@@ -6,6 +6,18 @@
 
 Deribit Options Monitor 是一个基于 **Deribit 公共 API** 的期权市场分析工具，专为期权卖方（Sell Put / Sell Call 收租策略）设计。它可以帮你实时监控市场波动率、筛选高性价比收租合约、追踪机构大额异动，让你在复杂的期权市场中找到清晰的交易机会。
 
+Deribit 使用教程
+1、[ Deribit 注册->](https://www.deribit.com/?reg=20758.7600)
+中国可正常进行 KYC，但需注意尽量少选择需要提供相关文件证明资料
+入金相关的资产信息尽量选择最低档即可，以免需要提供额外文件
+提交的银行账单里需要包括完整的地址、客户姓名、且是三个月以内。可用银行账单、支付宝资产证明等等
+
+2、[Deribit × SignalPlus 期权大赛，加入我的战队【链研社期权学习】->](https://t.signalplus.com/deribitislandcompetition?o=individualInvite\&r=DATIKF)
+
+3、[把Deribit API 绑定到SignalPlus教程->](<https:// signalplus.gitbook.io/signalplus-tut orial/how-to-sign-up-and-create-api-keys/how-to-create-api-keys-deribit>)
+
+4、[有不懂的可以加入我的交流群，7 月 30 号封群->](https://t.me/+_llf6cA63qo2MTRh)
+
 **v2.1.0 新增**: ✨ RV 已实现波动率模块 | RV/IV 择时信号 | Sell Call 推荐 | Max Pain 计算 | 8 种流向标签体系
 
 ## 🎉 最新版本 (v2.1.0)
